@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-🔥 AutoTech AI News Bot - Production Edition v3.0 (Branded)
-============================================================
-With FREE Image Generation + Backfill + Branding Features
+🔥 AutoTech AI News Bot - Production Edition v3.1 (With Dashboard)
+====================================================================
+With FREE Image Generation + Backfill + Branding + Web Dashboard
 Deployed on Render.com | Groq API (Free Tier) | Multi-Key Rotation
 Cron: cron-job.org (every minute) | Uptime: UptimeRobot (every 10 min)
 
 Environment Variables:
-  GROQ_API_KEYS        - Comma-separated Groq keys
-  TELEGRAM_BOT_TOKEN   - Telegram bot token
-  TELEGRAM_CHANNEL_ID  - e.g. @PulseAI_ir
-  CRON_SECRET          - Secret token for /cron endpoint
-  RENDER_DISK_PATH     - /opt/render/project/src/data
-  ENABLE_IMAGES        - true/false (default: true)
-  IMAGE_SOURCE         - og|ai|both (default: both)
-  BACKFILL_MODE        - true/false (default: false)
+ GROQ_API_KEYS - Comma-separated Groq keys
+ TELEGRAM_BOT_TOKEN - Telegram bot token
+ TELEGRAM_CHANNEL_ID - e.g. @PulseAI_ir
+ CRON_SECRET - Secret token for /cron endpoint
+ RENDER_DISK_PATH - /opt/render/project/src/data
+ ENABLE_IMAGES - true/false (default: true)
+ IMAGE_SOURCE - og|ai|both (default: both)
+ BACKFILL_MODE - true/false (default: false)
 """
 
 import os
@@ -32,7 +32,7 @@ from typing import List, Dict, Optional, Tuple
 from urllib.parse import quote
 from dateutil import parser as date_parser
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template_string
 
 # ═══════════════════════════════════════════════════════════════
 # Logging
@@ -151,15 +151,15 @@ class NewsDatabase:
             c.execute("SELECT 1 FROM sent_news WHERE news_hash=?", (h,))
             return c.fetchone() is not None
 
-    def mark_as_sent(self, url: str, title: str, source: str, 
+    def mark_as_sent(self, url: str, title: str, source: str,
                      image_url: str = "", image_source: str = "",
                      impact_level: str = "", time_to_impact: str = ""):
         h = hashlib.md5(url.encode()).hexdigest()
         with self.lock, self._connect() as conn:
             c = conn.cursor()
             c.execute(
-                """INSERT OR IGNORE INTO sent_news 
-                (news_hash,title,source,url,image_url,image_source,impact_level,time_to_impact) 
+                """INSERT OR IGNORE INTO sent_news
+                (news_hash,title,source,url,image_url,image_source,impact_level,time_to_impact)
                 VALUES (?,?,?,?,?,?,?,?)""",
                 (h, title, source, url, image_url, image_source, impact_level, time_to_impact)
             )
@@ -204,6 +204,15 @@ class NewsDatabase:
             c.execute("DELETE FROM sent_news WHERE sent_at < ?", (cutoff,))
             conn.commit()
             logger.info(f"🧹 Cleaned {c.rowcount} old records")
+
+    def get_recent(self, limit: int = 20):
+        with self.lock, self._connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT title, source, url, image_url, impact_level, time_to_impact, sent_at
+                FROM sent_news ORDER BY sent_at DESC LIMIT ?
+            """, (limit,))
+            return [dict(r) for r in c.fetchall()]
 
 # ═══════════════════════════════════════════════════════════════
 # Groq Key Manager
@@ -283,7 +292,6 @@ class AIProcessor:
         return None
 
     def analyze_news(self, title: str, content: str) -> Optional[Dict]:
-        """Generate branded content with impact analysis"""
         prompt = f"""You are a professional tech news editor for a premium Persian AI news channel called "پالس هوش".
 
 TASK: Analyze the following tech/AI news and produce a complete branded post in Persian.
@@ -311,8 +319,7 @@ Return ONLY the formatted output above."""
         if not result:
             return None
 
-        # Parse the response
-        parsed = {"impact_level": "", "time_to_impact": "", "headline": "", 
+        parsed = {"impact_level": "", "time_to_impact": "", "headline": "",
                   "summary": "", "why_it_matters": ""}
 
         for line in result.split("\n"):
@@ -331,7 +338,6 @@ Return ONLY the formatted output above."""
         return parsed if parsed["headline"] else None
 
     def format_post(self, analysis: Dict, link: str) -> str:
-        """Format the final Telegram post"""
         text = f"""{analysis.get('impact_level', '')} | {analysis.get('time_to_impact', '')}
 
 🎯 {analysis.get('headline', '')}
@@ -358,7 +364,7 @@ Output ONLY the prompt, nothing else."""
             result = result.strip().strip('"').strip("'")
             if len(result) > 200:
                 result = result[:200]
-        return result
+            return result
 
 # ═══════════════════════════════════════════════════════════════
 # Image Service - FREE
@@ -377,7 +383,7 @@ class ImageService:
             resp.raise_for_status()
             html = resp.text
 
-            og_match = re.search(r'<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']', html, re.IGNORECASE)
+            og_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
             if og_match:
                 img_url = og_match.group(1)
                 if img_url.startswith("//"):
@@ -389,7 +395,7 @@ class ImageService:
                 logger.info(f"✅ Found OG image")
                 return img_url
 
-            tw_match = re.search(r'<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']', html, re.IGNORECASE)
+            tw_match = re.search(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
             if tw_match:
                 img_url = tw_match.group(1)
                 if img_url.startswith("//"):
@@ -411,8 +417,8 @@ class ImageService:
         logger.info(f"🎨 Generating AI image via Pollinations...")
         return url
 
-    def get_image_for_article(self, article_url: str, article_title: str, 
-                               ai_prompt: Optional[str] = None) -> Tuple[Optional[str], str]:
+    def get_image_for_article(self, article_url: str, article_title: str,
+                              ai_prompt: Optional[str] = None) -> Tuple[Optional[str], str]:
         if not Config.ENABLE_IMAGES:
             return None, "none"
 
@@ -438,7 +444,6 @@ class NewsAggregator:
         })
 
     def parse_date(self, date_str: str) -> Optional[datetime]:
-        """Parse various RSS date formats"""
         if not date_str:
             return None
         try:
@@ -475,7 +480,6 @@ class NewsAggregator:
         return any(kw.lower() in text for kw in AI_TECH_KEYWORDS)
 
     def filter_by_date(self, entries: List[Dict], start: datetime, end: datetime) -> List[Dict]:
-        """Filter entries by date range"""
         filtered = []
         for entry in entries:
             pub_date = entry.get("published_parsed")
@@ -483,7 +487,6 @@ class NewsAggregator:
                 if start <= pub_date <= end:
                     filtered.append(entry)
             else:
-                # If no date, include it (fallback)
                 filtered.append(entry)
         return filtered
 
@@ -590,27 +593,22 @@ class NewsBot:
         return minutes_since >= Config.POST_INTERVAL_MINUTES
 
     def process_article(self, article: Dict) -> Tuple[bool, str]:
-        """Process a single article. Returns (success, error_msg)"""
         logger.info(f"📝 Processing: {article['title'][:70]}...")
 
-        # AI Analysis with branding
         analysis = self.ai.analyze_news(article["title"], article["summary"])
         if not analysis:
             return False, "AI analysis failed"
 
         text = self.ai.format_post(analysis, article["link"])
 
-        # Generate image prompt
         img_prompt = None
         if Config.IMAGE_SOURCE in ("ai", "both"):
             img_prompt = self.ai.generate_image_prompt(article["title"], article["summary"])
 
-        # Get image
         image_url, img_source = self.image_service.get_image_for_article(
             article["link"], article["title"], img_prompt
         )
 
-        # Send to Telegram
         success = self.publisher.send(text, article["link"], image_url)
 
         if success:
@@ -623,14 +621,14 @@ class NewsBot:
         else:
             return False, "Telegram send failed"
 
-    def run_cycle(self, date_filter: Optional[Tuple[datetime, datetime]] = None, 
+    def run_cycle(self, date_filter: Optional[Tuple[datetime, datetime]] = None,
                   backfill_mode: bool = False) -> Dict:
         if self.running:
             return {"status": "already_running"}
 
         self.running = True
         start_time = datetime.now()
-        results = {"sent": 0, "errors": [], "duration_sec": 0, 
+        results = {"sent": 0, "errors": [], "duration_sec": 0,
                    "images": {"og": 0, "ai": 0, "none": 0}, "mode": "normal"}
 
         try:
@@ -683,6 +681,504 @@ class NewsBot:
         return results
 
 # ═══════════════════════════════════════════════════════════════
+# Dashboard HTML Template
+# ═══════════════════════════════════════════════════════════════
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>پالس هوش | داشبورد مدیریت</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            text-align: center;
+            padding: 30px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 30px;
+        }
+        header h1 { font-size: 2.5rem; margin-bottom: 10px; }
+        header p { color: #aaa; font-size: 1.1rem; }
+        .status-bar {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+        .status-pill {
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 50px;
+            padding: 10px 25px;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .status-pill .dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: #4ade80;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+        }
+        .card h3 {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #a78bfa;
+            margin-bottom: 15px;
+        }
+        .card .value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+        .card .label { color: #aaa; font-size: 0.9rem; }
+        .action-section {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }
+        .action-section h2 {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #ccc;
+            font-size: 0.95rem;
+        }
+        .form-group input {
+            width: 100%;
+            max-width: 300px;
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.3);
+            color: #fff;
+            font-size: 1rem;
+            font-family: inherit;
+        }
+        .form-group input:focus {
+            outline: none;
+            border-color: #a78bfa;
+        }
+        .btn {
+            padding: 14px 32px;
+            border-radius: 12px;
+            border: none;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-family: inherit;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(102, 126, 234, 0.4);
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #f093fb, #f5576c);
+            color: #fff;
+            margin-right: 10px;
+        }
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(245, 87, 108, 0.4);
+        }
+        .btn-success {
+            background: linear-gradient(135deg, #4ade80, #22c55e);
+            color: #000;
+            margin-right: 10px;
+        }
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(74, 222, 128, 0.4);
+        }
+        .result-box {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 12px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.1);
+            display: none;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 0.85rem;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .result-box.show { display: block; }
+        .result-box.success { border-color: #4ade80; }
+        .result-box.error { border-color: #f5576c; }
+        .recent-news {
+            margin-top: 30px;
+        }
+        .recent-news h2 {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .news-item {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 15px 20px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .news-item .title {
+            font-weight: 600;
+            flex: 1;
+            min-width: 200px;
+        }
+        .news-item .meta {
+            color: #888;
+            font-size: 0.8rem;
+        }
+        .news-item .badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-og { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+        .badge-ai { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+        .badge-none { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
+        .env-section {
+            margin-top: 30px;
+        }
+        .env-section h2 {
+            margin-bottom: 20px;
+        }
+        .env-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .env-table th, .env-table td {
+            padding: 12px 16px;
+            text-align: right;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .env-table th {
+            color: #a78bfa;
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+        }
+        .env-table td { color: #ccc; font-size: 0.9rem; }
+        .env-table code {
+            background: rgba(0,0,0,0.4);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+        .loading {
+            display: inline-block;
+            width: 18px; height: 18px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        @media (max-width: 600px) {
+            header h1 { font-size: 1.8rem; }
+            .card .value { font-size: 2rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ پالس هوش</h1>
+            <p>داشبورد مدیریت ربات اخبار AI و تکنولوژی</p>
+        </header>
+
+        <div class="status-bar">
+            <div class="status-pill">
+                <span class="dot"></span>
+                <span>سرویس فعال</span>
+            </div>
+            <div class="status-pill">
+                <span>📅</span>
+                <span id="last-run">در حال بارگذاری...</span>
+            </div>
+            <div class="status-pill">
+                <span>🔑</span>
+                <span id="groq-status">در حال بارگذاری...</span>
+            </div>
+            <div class="status-pill">
+                <span>🖼️</span>
+                <span id="img-status">در حال بارگذاری...</span>
+            </div>
+        </div>
+
+        <div class="grid" id="stats-grid">
+            <div class="card">
+                <h3>📊 کل ارسال شده</h3>
+                <div class="value" id="stat-total">-</div>
+                <div class="label">خبر از شروع</div>
+            </div>
+            <div class="card">
+                <h3>📅 امروز</h3>
+                <div class="value" id="stat-today">-</div>
+                <div class="label">خبر ارسال شده</div>
+            </div>
+            <div class="card">
+                <h3>🖼️ با تصویر</h3>
+                <div class="value" id="stat-img">-</div>
+                <div class="label">درصد تصویردار</div>
+            </div>
+            <div class="card">
+                <h3>⏱️ فاصله ارسال</h3>
+                <div class="value" id="stat-interval">-</div>
+                <div class="label">دقیقه</div>
+            </div>
+        </div>
+
+        <div class="action-section">
+            <h2>🚀 اجرای دستی</h2>
+            <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                <button class="btn btn-success" onclick="runNormal()">
+                    <span id="btn-normal-text">▶️ اجرای عادی</span>
+                </button>
+                <button class="btn btn-primary" onclick="runForce()">
+                    <span id="btn-force-text">⚡ اجرای اجباری</span>
+                </button>
+            </div>
+            <div class="result-box" id="normal-result"></div>
+        </div>
+
+        <div class="action-section">
+            <h2>📚 ارسال اخبار قدیمی (Backfill)</h2>
+            <p style="color:#aaa; margin-bottom:20px;">
+                با این قابلیت می‌توانید اخبار مربوط به یک بازه تاریخی خاص را جستجو و ارسال کنید.
+                مثلاً اخبار ماه ژانویه ۲۰۲۶.
+            </p>
+            <div class="form-group">
+                <label>📅 تاریخ شروع (YYYY-MM-DD)</label>
+                <input type="text" id="backfill-start" value="2026-01-01" placeholder="2026-01-01">
+            </div>
+            <div class="form-group">
+                <label>📅 تاریخ پایان (YYYY-MM-DD)</label>
+                <input type="text" id="backfill-end" value="2026-08-15" placeholder="2026-08-15">
+            </div>
+            <div class="form-group">
+                <label>🔐 رمز عبور Cron Secret</label>
+                <input type="password" id="backfill-secret" placeholder="رمز عبور را وارد کنید...">
+            </div>
+            <button class="btn btn-danger" onclick="runBackfill()">
+                <span id="btn-backfill-text">📚 اجرای Backfill</span>
+            </button>
+            <div class="result-box" id="backfill-result"></div>
+        </div>
+
+        <div class="recent-news">
+            <h2>📰 آخرین اخبار ارسال شده</h2>
+            <div id="recent-list">
+                <p style="color:#888; text-align:center; padding:20px;">در حال بارگذاری...</p>
+            </div>
+        </div>
+
+        <div class="env-section">
+            <h2>⚙️ متغیرهای محیطی فعال</h2>
+            <table class="env-table">
+                <thead>
+                    <tr>
+                        <th>نام متغیر</th>
+                        <th>مقدار فعلی</th>
+                        <th>توضیحات</th>
+                    </tr>
+                </thead>
+                <tbody id="env-body">
+                </tbody>
+            </table>
+        </div>
+
+        <footer style="text-align:center; padding:40px 0 20px; color:#666; font-size:0.85rem;">
+            <p>پالس هوش v3.1 | ساخته شده با ❤️ برای جامعه فارسی‌زبان تکنولوژی</p>
+        </footer>
+    </div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/health');
+                const data = await res.json();
+                document.getElementById('stat-total').textContent = data.stats.total_sent;
+                document.getElementById('stat-today').textContent = data.stats.today_sent;
+                const imgPct = data.stats.total_sent > 0
+                    ? Math.round((data.stats.with_image / data.stats.total_sent) * 100) + '%'
+                    : '0%';
+                document.getElementById('stat-img').textContent = imgPct;
+                document.getElementById('stat-interval').textContent = data.interval || '30';
+                document.getElementById('groq-status').textContent = `Groq: ${data.groq_keys_available}/${data.groq_keys_total} کلید فعال`;
+                document.getElementById('img-status').textContent = data.images_enabled ? `تصویر: ${data.image_source}` : 'تصویر: غیرفعال';
+            } catch(e) { console.error(e); }
+        }
+
+        async function fetchLastRun() {
+            try {
+                const res = await fetch('/stats');
+                const data = await res.json();
+                document.getElementById('last-run').textContent = 'آخرین اجرا: بررسی شد';
+            } catch(e) { console.error(e); }
+        }
+
+        async function fetchRecent() {
+            try {
+                const res = await fetch('/recent');
+                const data = await res.json();
+                const container = document.getElementById('recent-list');
+                if (!data.recent || data.recent.length === 0) {
+                    container.innerHTML = '<p style="color:#888; text-align:center; padding:20px;">هنوز خبری ارسال نشده</p>';
+                    return;
+                }
+                container.innerHTML = data.recent.map(n => {
+                    const badgeClass = n.image_source === 'og' ? 'badge-og' : n.image_source === 'ai' ? 'badge-ai' : 'badge-none';
+                    const badgeText = n.image_source === 'og' ? 'OG تصویر' : n.image_source === 'ai' ? 'AI تصویر' : 'بدون تصویر';
+                    return `<div class="news-item">
+                        <div class="title">${n.title}</div>
+                        <div class="meta">${n.source} | ${n.sent_at}</div>
+                        <span class="badge ${badgeClass}">${badgeText}</span>
+                    </div>`;
+                }).join('');
+            } catch(e) { console.error(e); }
+        }
+
+        async function fetchEnv() {
+            try {
+                const res = await fetch('/env-info');
+                const data = await res.json();
+                const tbody = document.getElementById('env-body');
+                tbody.innerHTML = data.env_vars.map(v => `
+                    <tr>
+                        <td><code>${v.name}</code></td>
+                        <td><code>${v.value}</code></td>
+                        <td>${v.desc}</td>
+                    </tr>
+                `).join('');
+            } catch(e) { console.error(e); }
+        }
+
+        function showResult(id, text, isError) {
+            const el = document.getElementById(id);
+            el.textContent = text;
+            el.className = 'result-box show ' + (isError ? 'error' : 'success');
+        }
+
+        async function runNormal() {
+            const btn = document.getElementById('btn-normal-text');
+            btn.innerHTML = '<span class="loading"></span> در حال اجرا...';
+            try {
+                const res = await fetch('/cron?secret=' + encodeURIComponent(document.getElementById('backfill-secret').value));
+                const data = await res.json();
+                showResult('normal-result', JSON.stringify(data, null, 2), data.status === 'error');
+                fetchStats();
+                fetchRecent();
+            } catch(e) {
+                showResult('normal-result', '❌ خطا: ' + e.message, true);
+            }
+            btn.innerHTML = '▶️ اجرای عادی';
+        }
+
+        async function runForce() {
+            const btn = document.getElementById('btn-force-text');
+            btn.innerHTML = '<span class="loading"></span> در حال اجرا...';
+            try {
+                const res = await fetch('/force-run?secret=' + encodeURIComponent(document.getElementById('backfill-secret').value));
+                const data = await res.json();
+                showResult('normal-result', JSON.stringify(data, null, 2), data.status === 'error');
+                fetchStats();
+                fetchRecent();
+            } catch(e) {
+                showResult('normal-result', '❌ خطا: ' + e.message, true);
+            }
+            btn.innerHTML = '⚡ اجرای اجباری';
+        }
+
+        async function runBackfill() {
+            const secret = document.getElementById('backfill-secret').value;
+            const start = document.getElementById('backfill-start').value;
+            const end = document.getElementById('backfill-end').value;
+            if (!secret) { alert('لطفاً رمز عبور Cron Secret را وارد کنید'); return; }
+
+            const btn = document.getElementById('btn-backfill-text');
+            btn.innerHTML = '<span class="loading"></span> در حال جستجوی اخبار...';
+            try {
+                const url = `/backfill?secret=${encodeURIComponent(secret)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+                const res = await fetch(url);
+                const data = await res.json();
+                showResult('backfill-result', JSON.stringify(data, null, 2), data.status === 'error');
+                fetchStats();
+                fetchRecent();
+            } catch(e) {
+                showResult('backfill-result', '❌ خطا: ' + e.message, true);
+            }
+            btn.innerHTML = '📚 اجرای Backfill';
+        }
+
+        fetchStats();
+        fetchLastRun();
+        fetchRecent();
+        fetchEnv();
+        setInterval(fetchStats, 30000);
+        setInterval(fetchRecent, 60000);
+    </script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════════
 # Flask App
 # ═══════════════════════════════════════════════════════════════
 app = Flask(__name__)
@@ -691,13 +1187,18 @@ bot = NewsBot()
 @app.route("/")
 def index():
     return jsonify({
-        "service": "AutoTech AI News Bot v3.0",
+        "service": "AutoTech AI News Bot v3.1",
         "brand": "پالس هوش | PulseAI",
         "status": "running",
-        "features": ["groq_rotation", "free_images", "og_extraction", "ai_generation", 
-                     "impact_scoring", "backfill", "branded_content"],
+        "dashboard": "/dashboard",
+        "features": ["groq_rotation", "free_images", "og_extraction", "ai_generation",
+                       "impact_scoring", "backfill", "branded_content", "web_dashboard"],
         "time": datetime.now().isoformat(),
     })
+
+@app.route("/dashboard")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML)
 
 @app.route("/health")
 def health():
@@ -706,6 +1207,7 @@ def health():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "stats": stats,
+        "interval": Config.POST_INTERVAL_MINUTES,
         "groq_keys_total": len(Config.GROQ_API_KEYS),
         "groq_keys_available": len(Config.GROQ_API_KEYS) - len(bot.groq_keys.failed_keys),
         "images_enabled": Config.ENABLE_IMAGES,
@@ -723,7 +1225,6 @@ def cron():
 
 @app.route("/backfill", methods=["POST", "GET"])
 def backfill():
-    """Backfill endpoint - send historical news from date range"""
     provided = request.args.get("secret") or request.headers.get("X-Cron-Secret")
     if provided != Config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 403
@@ -745,6 +1246,10 @@ def backfill():
 def stats():
     return jsonify(bot.db.get_stats())
 
+@app.route("/recent")
+def recent():
+    return jsonify({"recent": bot.db.get_recent(limit=20)})
+
 @app.route("/force-run")
 def force_run():
     provided = request.args.get("secret")
@@ -752,6 +1257,24 @@ def force_run():
         return jsonify({"error": "unauthorized"}), 403
     result = bot.run_cycle()
     return jsonify(result)
+
+@app.route("/env-info")
+def env_info():
+    """Return safe env var info for dashboard display"""
+    env_vars = [
+        {"name": "GROQ_API_KEYS", "value": f"{len(Config.GROQ_API_KEYS)} کلید تنظیم شده", "desc": "کلیدهای API Groq (با کاما جدا شوند)"},
+        {"name": "GROQ_MODEL", "value": Config.GROQ_MODEL, "desc": "مدل Groq (پیش‌فرض: llama-3.1-70b-versatile)"},
+        {"name": "TELEGRAM_BOT_TOKEN", "value": "✅ تنظیم شده" if Config.TELEGRAM_BOT_TOKEN else "❌ تنظیم نشده", "desc": "توکن ربات تلگرام از @BotFather"},
+        {"name": "TELEGRAM_CHANNEL_ID", "value": Config.TELEGRAM_CHANNEL_ID or "❌ تنظیم نشده", "desc": "آیدی کانال مثل @PulseAI_ir"},
+        {"name": "CRON_SECRET", "value": "✅ تنظیم شده" if Config.CRON_SECRET != "change-me-please" else "⚠️ پیش‌فرض (ناامن)", "desc": "رمز محافظت endpoint ها"},
+        {"name": "RENDER_DISK_PATH", "value": Config.RENDER_DISK_PATH, "desc": "مسیر دیسک برای دیتابیس"},
+        {"name": "POST_INTERVAL_MINUTES", "value": str(Config.POST_INTERVAL_MINUTES), "desc": "فاصله زمانی بین ارسال‌ها (دقیقه)"},
+        {"name": "MAX_NEWS_PER_RUN", "value": str(Config.MAX_NEWS_PER_RUN), "desc": "حداکثر خبر در هر اجرا"},
+        {"name": "ENABLE_IMAGES", "value": str(Config.ENABLE_IMAGES), "desc": "فعال‌سازی تصاویر (true/false)"},
+        {"name": "IMAGE_SOURCE", "value": Config.IMAGE_SOURCE, "desc": "منبع تصویر: og / ai / both"},
+        {"name": "BACKFILL_DELAY_SECONDS", "value": str(Config.BACKFILL_DELAY_SECONDS), "desc": "تأخیر بین ارسال در backfill (ثانیه)"},
+    ]
+    return jsonify({"env_vars": env_vars})
 
 # ═══════════════════════════════════════════════════════════════
 # Entry Point

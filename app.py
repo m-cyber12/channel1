@@ -209,7 +209,7 @@ class NewsDatabase:
         with self.lock, self._connect() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT title, source, url, image_url, impact_level, time_to_impact, sent_at
+                SELECT title, source, url, image_url, image_source, impact_level, time_to_impact, sent_at
                 FROM sent_news ORDER BY sent_at DESC LIMIT ?
             """, (limit,))
             return [dict(r) for r in c.fetchall()]
@@ -229,12 +229,21 @@ class GroqKeyManager:
 
     def get_key(self) -> Optional[str]:
         with self.lock:
+            if not self.keys:
+                logger.error("❌ GROQ_API_KEYS is not configured")
+                return None
+
             available = [k for k in self.keys if k not in self.failed_keys]
             if not available:
                 logger.warning("⚠️ All Groq keys failed! Resetting...")
                 self.failed_keys.clear()
                 available = self.keys
-            available.sort(key=lambda k: self.last_used[k])
+
+            if not available:
+                logger.error("❌ No Groq key is currently available")
+                return None
+
+            available.sort(key=lambda k: self.last_used.get(k, 0))
             key = available[0]
             self.last_used[key] = time.time()
             return key
@@ -481,10 +490,13 @@ class NewsAggregator:
 
     def filter_by_date(self, entries: List[Dict], start: datetime, end: datetime) -> List[Dict]:
         filtered = []
+        start_day = start.date()
+        end_day = end.date()
+
         for entry in entries:
             pub_date = entry.get("published_parsed")
             if pub_date:
-                if start <= pub_date <= end:
+                if start_day <= pub_date.date() <= end_day:
                     filtered.append(entry)
             else:
                 filtered.append(entry)
@@ -528,7 +540,7 @@ class TelegramPublisher:
         try:
             resp = self.session.post(
                 f"{self.base_url}/sendMessage",
-                json={"chat_id": self.channel, "text": full_text, "parse_mode": "HTML", "disable_web_page_preview": False},
+                json={"chat_id": self.channel, "text": full_text, "disable_web_page_preview": False},
                 timeout=30
             )
             resp.raise_for_status()
@@ -553,7 +565,7 @@ class TelegramPublisher:
         try:
             resp = self.session.post(
                 f"{self.base_url}/sendPhoto",
-                json={"chat_id": self.channel, "photo": photo_url, "caption": full_caption, "parse_mode": "HTML"},
+                json={"chat_id": self.channel, "photo": photo_url, "caption": full_caption},
                 timeout=45
             )
             resp.raise_for_status()
@@ -592,12 +604,22 @@ class NewsBot:
         minutes_since = (datetime.now() - last).total_seconds() / 60
         return minutes_since >= Config.POST_INTERVAL_MINUTES
 
-    def process_article(self, article: Dict) -> Tuple[bool, str]:
+    def validate_runtime_config(self) -> List[str]:
+        errors = []
+        if not Config.GROQ_API_KEYS:
+            errors.append("GROQ_API_KEYS تنظیم نشده")
+        if not Config.TELEGRAM_BOT_TOKEN:
+            errors.append("TELEGRAM_BOT_TOKEN تنظیم نشده")
+        if not Config.TELEGRAM_CHANNEL_ID:
+            errors.append("TELEGRAM_CHANNEL_ID تنظیم نشده")
+        return errors
+
+    def process_article(self, article: Dict) -> Tuple[bool, str, str]:
         logger.info(f"📝 Processing: {article['title'][:70]}...")
 
         analysis = self.ai.analyze_news(article["title"], article["summary"])
         if not analysis:
-            return False, "AI analysis failed"
+            return False, "AI analysis failed", "none"
 
         text = self.ai.format_post(analysis, article["link"])
 
@@ -617,22 +639,31 @@ class NewsBot:
                 image_url or "", img_source,
                 analysis.get("impact_level", ""), analysis.get("time_to_impact", "")
             )
-            return True, ""
+            return True, "", img_source
         else:
-            return False, "Telegram send failed"
+            return False, "Telegram send failed", img_source
 
     def run_cycle(self, date_filter: Optional[Tuple[datetime, datetime]] = None,
-                  backfill_mode: bool = False) -> Dict:
+                  backfill_mode: bool = False,
+                  ignore_interval: bool = False) -> Dict:
         if self.running:
             return {"status": "already_running"}
 
-        self.running = True
         start_time = datetime.now()
         results = {"sent": 0, "errors": [], "duration_sec": 0,
-                   "images": {"og": 0, "ai": 0, "none": 0}, "mode": "normal"}
+                   "images": {"og": 0, "ai": 0, "none": 0},
+                   "mode": "backfill" if backfill_mode else "normal"}
+
+        config_errors = self.validate_runtime_config()
+        if config_errors:
+            results["errors"] = config_errors
+            results["status"] = "error"
+            return results
+
+        self.running = True
 
         try:
-            if not backfill_mode and not self.should_run():
+            if not backfill_mode and not ignore_interval and not self.should_run():
                 last = self.db.get_last_run()
                 logger.info(f"⏳ Skipping. Last run: {last}. Interval: {Config.POST_INTERVAL_MINUTES}min")
                 results["status"] = "skipped_interval"
@@ -640,7 +671,6 @@ class NewsBot:
 
             mode_str = "BACKFILL" if backfill_mode else "NORMAL"
             logger.info(f"🚀 Starting {mode_str} cycle...")
-            results["mode"] = mode_str.lower()
 
             all_news = self.aggregator.collect_all(date_filter=date_filter)
             logger.info(f"📊 Found {len(all_news)} relevant articles")
@@ -651,7 +681,9 @@ class NewsBot:
             to_process = new_news[:Config.MAX_NEWS_PER_RUN]
 
             for article in to_process:
-                success, error = self.process_article(article)
+                success, error, img_source = self.process_article(article)
+
+                results["images"][img_source] = results["images"].get(img_source, 0) + 1
 
                 if success:
                     results["sent"] += 1
@@ -667,7 +699,12 @@ class NewsBot:
                 if datetime.now().day == 1:
                     self.db.cleanup_old(days=60)
 
-            results["status"] = "success"
+            if results["errors"] and results["sent"] == 0:
+                results["status"] = "error"
+            elif results["errors"]:
+                results["status"] = "partial_success"
+            else:
+                results["status"] = "success"
 
         except Exception as e:
             logger.exception("❌ Cycle error")
@@ -1252,10 +1289,10 @@ def recent():
 
 @app.route("/force-run")
 def force_run():
-    provided = request.args.get("secret")
+    provided = request.args.get("secret") or request.headers.get("X-Cron-Secret")
     if provided != Config.CRON_SECRET:
         return jsonify({"error": "unauthorized"}), 403
-    result = bot.run_cycle()
+    result = bot.run_cycle(ignore_interval=True)
     return jsonify(result)
 
 @app.route("/env-info")
